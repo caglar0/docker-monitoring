@@ -1,0 +1,138 @@
+from fastapi import Depends, FastAPI, Response
+from datetime import datetime
+import re
+from sqlalchemy.orm import Session
+from database import AuditEvent, get_db
+from fastapi.middleware.cors import CORSMiddleware
+import time
+import asyncio
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/logs")
+def get_logs_api(db: Session = Depends(get_db)):
+    logs = db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(50).all()
+    return logs
+
+AUDIT_TIMESTAMP_PATTERN = re.compile(r"msg=audit\((\d+\.\d+):\d+\)")
+AUDIT_SUCCESS_PATTERN = re.compile(r"success=(\w+)")
+AUDIT_PID_PATTERN = re.compile(r"pid=(\d+)")
+AUDIT_EXE_PATTERN = re.compile(r'exe="([^"]+)"')
+AUDIT_SYSCALL_PATTERN = re.compile(r"syscall=(\d+)")
+AUDIT_ID_PATTERN = re.compile(r'msg=audit\(([\d.]+:\d+)\)')
+
+event_buffer: dict[str, dict] = {}
+buffer_lock = asnycio.Lock()
+FLUSH_TIMEOUT_SECONDS = 3 
+
+def extract_audit_id(line: str) -> str | None:
+    match = AUDIT_ID_PATTERN.search(line)
+    return match.group(1) if match else None
+    
+def parse_log(log_line: str):
+    if "docker" not in log_line:
+        return None
+    
+    try:
+        timestamp_match = AUDIT_TIMESTAMP_PATTERN.search(log_line)
+        success_match = AUDIT_SUCCESS_PATTERN.search(log_line)
+        pid_match = AUDIT_PID_PATTERN.search(log_line)
+        exe_match = AUDIT_EXE_PATTERN.search(log_line)
+        syscall_match = AUDIT_SYSCALL_PATTERN.search(log_line)
+        argc_match = re.search(r'argc=(\d+)', log_line)
+        
+        if not timestamp_match:
+            return None
+        epoch_time = float(timestamp_match.group(1))
+        readable_date = datetime.fromtimestamp(epoch_time).strftime(
+                "%Y-%m-%d %H:%M:%S"
+        )
+        status_val = (
+            "SUCCESS"
+            if (success_match and success_match.group(1) == "yes")
+            else "FAILED"
+        )
+        pid_val = int(pid_match.group(1)) if pid_match else None
+        exe_val = exe_match.group(1) if exe_match else "unknown"
+        syscall_num = syscall_match.group(1) if syscall_match else "unknown"
+        operation_type = "EXECUTE/RUN" #if syscall_num == "59" else "FILE_MODIFICATION"
+        argc = int(argc_match.group(1)) if argc_match else None
+
+        full_command = ""
+        
+        if argc is not None and argc > 0:
+            arguments = []
+            for i in range(argc):
+                #TODO: argumanları parse'la ve komutu tekrar birleştir.
+                #log formatı:  argc=2 a0="docker" a1="ps"
+                pattern = rf'a{i}="([^\s]+)'
+                arg_match = re.search(pattern, log_line)
+
+                if arg_match:
+                    actual_value = arg_match.group(1)
+                    arguments.append(arg_match.group(1))
+                    
+            full_command = " ".join(arguments).replace('"', '')
+                
+        return {
+            "timestamp": readable_date,
+            "status": status_val,
+            "pid": pid_val,
+            "executable": exe_val,
+            "operation": operation_type,
+            "syscall": syscall_num,
+            "command": full_command,
+        }
+    
+
+    except Exception as e:
+        print(f"Parser Hatası: {e}")
+        return None
+     
+@app.get("/")
+def read_root():
+    return {
+        "status": "success",
+        "message": "Docker Monitoring backend active\n",
+        }
+
+@app.post("/receiver")
+def receive_agent_logs(payload: dict, db: Session = Depends(get_db)):
+    raw_log = payload.get("message", "")
+    parsed_res = parse_log(raw_log)
+    
+    if parsed_res:
+        db_event = AuditEvent(
+            timestamp=parsed_res["timestamp"],
+            status=parsed_res["status"],
+            pid=parsed_res["pid"],            executable=parsed_res["executable"],
+            operation=parsed_res["operation"],
+            syscall=parsed_res["syscall"],
+            command=parsed_res["command"],
+        )
+        
+        db.add(db_event)
+        db.commit() 
+        db.refresh(db_event)
+
+        print(f"[*] Log başarıyla DB'ye kaydedildi! ID: {db_event.id}")
+        return Response(content="Log DB'ye kaydedildi\n", media_type="text/plain")
+
+    return Response(
+        content="Log atlandı (Docker değil)\n",
+        media_type="text/plain",
+        status_code=200,
+    )
+
+#test
+#@app.get("/logs")
+#def get_stored_logs(db: Session = Depends(get_db), limit: int = 10):
+#    return db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(limit).all() 

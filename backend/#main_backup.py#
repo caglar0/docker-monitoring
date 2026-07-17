@@ -1,0 +1,180 @@
+from fastapi import Depends, FastAPI, Response
+from datetime import datetime
+import re
+from sqlalchemy.orm import Session
+from database import AuditEvent, get_db, SessionLocal
+from fastapi.middleware.cors import CORSMiddleware
+import time
+import asyncio
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+AUDIT_TIMESTAMP_PATTERN = re.compile(r"msg=audit\((\d+\.\d+):\d+\)")
+AUDIT_SUCCESS_PATTERN = re.compile(r"success=(\w+)")
+AUDIT_PID_PATTERN = re.compile(r"pid=(\d+)")
+AUDIT_EXE_PATTERN = re.compile(r'exe="([^"]+)"')
+AUDIT_SYSCALL_PATTERN = re.compile(r"syscall=(\d+)")
+ARGC_PATTERN = re.compile(r'argc=(\d+)')
+# log agg.
+AUDIT_ID_PATTERN = re.compile(r'msg=audit\(([\d.]+:\d+)\)')
+AUDIT_UID_PATTERN= re.compile(r'UID="([^"]+)"')
+
+pending_events: dict[str, dict] = {}
+FLUSH_TIMEOUT = 1.5
+
+#log agg.
+def extract_audit_id(line: str) -> str | None:
+    match = AUDIT_ID_PATTERN.search(line)
+    return match.group(1) if match else None
+
+#log agg.
+def extract_execve(line :str) -> str:
+    argc_match = ARGC_PATTERN.search(line)
+    if not argc_match:
+        return ""
+    
+    argc = int(argc_match.group(1))
+    arguments = []
+    
+    for i in range(argc):
+        arg_match = re.search(rf'a{i}="([^"]*)"', line)
+        if arg_match:
+            arguments.append(arg_match.group(1))
+                        
+    return " " .join(arguments).replace('"', '')
+
+    
+def parse_log(lines: list[str]) -> dict | None:  
+    record = {
+        "timestamp": None,
+        "user": "unknown",
+        "status": "UNKNOWN",
+        "pid": None,
+        "executable": "unknown",
+        "operation": "EXECUTE/RUN",
+        "syscall": "unknown",
+        "command": "",
+    }
+    has_execve = False
+    has_syscall = False
+    
+    for line in lines:
+        if record["timestamp"] is None:
+            ts_match = AUDIT_TIMESTAMP_PATTERN.search(line)
+            if ts_match:
+                epoch_time = float(ts_match.group(1))
+                record["timestamp"] = datetime.fromtimestamp(epoch_time).strftime(
+                 "%Y-%m-%d %H:%M:%S"
+                )
+
+            e
+        if "type=SYSCALL" in line:
+            has_syscall = True
+            uid_match = AUDIT_UID_PATTERN.search(line)
+            success_match = AUDIT_SUCCESS_PATTERN.search(line)
+            pid_match = AUDIT_PID_PATTERN.search(line)
+            exe_match = AUDIT_EXE_PATTERN.search(line)
+            syscall_match = AUDIT_SYSCALL_PATTERN.search(line)
+
+            if success_match:
+                record["status"] = "SUCCESS" if success_match.group(1) else "FAILED"
+            if uid_match:
+                record["user"]= uid_match.group(1)
+            if pid_match:
+                record["pid"] = int(pid_match.group(1))
+            if exe_match:
+                record["executable"] = exe_match.group(1)
+            if syscall_match:
+                record["syscall"] = syscall_match.group(1)
+        elif "type=EXECVE" in line:
+            has_execve = True
+            record["command"] = extract_execve(line)
+
+    combined_text = (record["executable"] or "") + " " + (record["command"] or "")
+    if "docker" not in combined_text:
+        return None
+
+    if not (has_execve or has_syscall) or record["timestamp"] is None:
+        return None
+
+    return record
+
+#check buffer in intervals and save the expired events into the db 
+async def flush_loop():
+    while True:
+        await asyncio.sleep(1)
+        now = time.time()
+        expired_ids = [
+            audit_id for audit_id,data in pending_events.items()
+            if now - data["last_seen"] > FLUSH_TIMEOUT
+        ]
+        for audit_id in expired_ids:
+            data = pending_events.pop(audit_id)
+            parsed_res = parse_log(data["lines"])
+
+            if parsed_res:
+                db = SessionLocal()
+                try:
+                    db_event = AuditEvent(
+                        timestamp=parsed_res["timestamp"],
+                        user=parsed_res["user"],
+                        status=parsed_res["status"],
+                        pid=parsed_res["pid"],
+                        executable=parsed_res["executable"],
+                        operation=parsed_res["operation"],
+                        syscall=parsed_res["syscall"],
+                        command=parsed_res["command"],
+                    )
+                    db.add(db_event)
+                    db.commit()
+                    print(f"[*] Event kaydedildi (audit_id={audit_id}), ID: {db_event.id}")
+                finally:
+                    db.close()
+                    
+
+@app.on_event("startup")
+async def start_flush_task():
+    asyncio.create_task(flush_loop())
+    
+@app.get("/api/logs")
+def get_logs_api(db: Session = Depends(get_db)):
+    logs = db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(50).all()
+    return logs
+
+    
+@app.get("/")
+def read_root():
+    return {
+        "status": "success",
+        "message": "Docker Monitoring backend active\n",
+    }
+
+@app.post("/receiver")
+def receive_agent_logs(payload: dict):
+    raw_log = payload.get("message", "")
+    audit_id = extract_audit_id(raw_log)
+
+    if not audit_id:
+        return Response(content="audit_id bulunamadı\n", status_code=200)
+
+    if audit_id not in pending_events:
+        pending_events[audit_id] = {"lines": [], "last_seen": time.time()}
+
+    pending_events[audit_id]["lines"].append(raw_log)
+    pending_events[audit_id]["last_seen"] = time.time()
+
+    return Response(content="Log buffer'a eklendi\n", media_type="text/plain")
+
+#test
+#@app.get("/logs")
+#def get_stored_logs(db: Session = Depends(get_db), limit: int = 10):
+#    return db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(limit).all() 

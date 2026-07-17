@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: always
+    depends_on:
+    - db
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - DATABASE_URL=postgresql://audit_user:audit_pass123@db:5432/audit_log_db
+
+  db:
+    image: postgres:15-alpine
+    container_name: monitoring_postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=audit_user
+      - POSTGRES_PASSWORD=audit_pass123
+      - POSTGRES_DB=audit_log_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+
+      
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: monitoring_grafana
+    restart: always
+    ports:
+      - "3000:3000"  
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=Europe/Istanbul
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin_pass_123
+    depends_on:
+      - db
+
+  frontend:
+   build: ./frontend
+   container_name: monitoring_frontend
+   ports:
+     - "5173:5173"  # React arayüzüne buradan erişeceğiz
+   restart: always
+   depends_on:
+     - backend
+
+volumes:
+  postgres_data:
+  grafana_data:

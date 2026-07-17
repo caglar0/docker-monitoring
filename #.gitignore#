@@ -1,0 +1,18 @@
+# Frontend bağımlılıkları
+frontend/node_modules/
+frontend/dist/
+
+# Python önbellekleri
+**/__pycache__/
+*.pyc
+
+# Docker Veritabanı Klasörü 
+postgres_data/
+
+# Çevre değişkenleri ve gizli dosyalar
+.env
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
