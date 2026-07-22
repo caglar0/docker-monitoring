@@ -1,5 +1,5 @@
-from fastapi import Depends, FastAPI, Response
-from datetime import datetime
+from fastapi import Depends, FastAPI, Response, HTTPException, Header
+from datetime import datetime, timedelta
 import re
 from sqlalchemy.orm import Session
 from database import AuditEvent, SystemMetrics, ContainerInfo, ContainerEvent, get_db, SessionLocal
@@ -7,6 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import time
 import asyncio
 from collections import deque
+import os
+import jwt
+
 
 app = FastAPI()
 
@@ -17,6 +20,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+JWT_SECRET = os.getenv("JWT_SECRET", "insecure-default-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 72
+
 
 DOCKER_SUBCOMMANDS = {
     "run", "exec", "ps", "start", "stop", "restart", "rm", "rmi",
@@ -32,6 +42,8 @@ DOCKER_SUBCOMMANDS = {
 NO_POSITIONAL_ARG_SUBCOMMANDS = {
     "ps", "images", "version", "info", "system", "events", "login", "logout",
 }
+
+OWNER_ASSIGNING_SUBCOMMANDS = {"run", "create"}
 
 AUDIT_TIMESTAMP_PATTERN = re.compile(r"msg=audit\((\d+\.\d+):\d+\)")
 AUDIT_SUCCESS_PATTERN = re.compile(r"success=(\w+)")
@@ -52,10 +64,49 @@ REQUIRES_CONTAINER_EVENT_MATCH = {
     "exec", "start", "stop", "restart", "kill", "rm", "logs", "attach", "cp", "pause", "unpause",
 }
 
+NOISE_SUBCOMMANDS = {
+    "info", "version"
+}
+
 # Yetkisiz erişim kontrolü uygulanacak subcommand'ler
 OWNERSHIP_SENSITIVE_SUBCOMMANDS = {
     "exec", "start", "stop", "restart", "kill", "rm", "logs", "attach", "cp", "pause", "unpause",
 }
+
+def create_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_token(authorization: str = Header(None)):
+    """Korumalı endpoint'ler için dependency. Authorization: Bearer <token> bekler."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token bulunamadı")
+
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload["sub"]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token süresi doldu")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Geçersiz token")
+
+
+@app.post("/api/auth/login")
+def login(payload: dict):
+    username = payload.get("username", "")
+    password = payload.get("password", "")
+
+    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Kullanıcı adı veya şifre hatalı")
+
+    token = create_token(username)
+    return {"token": token, "username": username}
+
 
 
 def is_valid_command(cmd: str) -> bool:
@@ -65,8 +116,12 @@ def is_valid_command(cmd: str) -> bool:
     if len(parts) < 2:
         return False
     subcommand = parts[1].lower()
+    if subcommand in NOISE_SUBCOMMANDS:
+        return False  
+    
     if subcommand not in DOCKER_SUBCOMMANDS:
         return False
+    
     if subcommand in NO_POSITIONAL_ARG_SUBCOMMANDS:
         extra_args = parts[2:]
         for arg in extra_args:
@@ -207,6 +262,24 @@ async def flush_loop():
 
                 db = SessionLocal()
                 try:
+                    # --- YENİ: docker run/create ile container oluşturulduysa, komutu çalıştıran kullanıcıyı owner yap ---
+                    if subcommand in OWNER_ASSIGNING_SUBCOMMANDS and container_id:
+                        info = db.query(ContainerInfo).filter(ContainerInfo.container_id == container_id).first()
+                        if info is None:
+                            info = ContainerInfo(
+                                container_id=container_id,
+                                container_name=container_name or "unknown",
+                                owner=parsed_res["user"],
+                                status="running",
+                                server_name="unknown",
+                                last_seen=datetime.now(),
+                            )
+                            db.add(info)
+                        elif not info.owner or info.owner == "unknown":
+                            info.owner = parsed_res["user"]
+                            db.commit()
+                            print(f"[*] Container owner atandı: {container_name} -> {parsed_res['user']}", flush=True)
+
                     unauthorized = False
                     if subcommand in OWNERSHIP_SENSITIVE_SUBCOMMANDS and (container_id or container_name):
                         unauthorized = check_unauthorized_access(db, container_id, container_name, parsed_res["user"])
@@ -229,7 +302,7 @@ async def flush_loop():
 
                     if unauthorized:
                         print(f"[⚠️] YETKİSİZ ERİŞİM: {parsed_res['user']} -> {container_name}", flush=True)
-                    print(f"[*] Event kaydedildi (audit_id={audit_id}), container={container_name}", flush=True)
+                        print(f"[*] Event kaydedildi (audit_id={audit_id}), container={container_name}", flush=True)
                 finally:
                     db.close()
 
@@ -273,6 +346,7 @@ def get_logs_api(
     command_contains: str = None,
     unauthorized_only: bool = False,
     limit: int = 100,
+    _current_user: str = Depends(verify_token),   
 ):
     query = db.query(AuditEvent)
     if user:
@@ -290,8 +364,34 @@ def get_logs_api(
     if unauthorized_only:
         query = query.filter(AuditEvent.unauthorized == True) 
 
-    return query.order_by(AuditEvent.id.desc()).limit(limit).all()
+    logs = query.order_by(AuditEvent.id.desc()).limit(limit).all()
 
+    # Container owner bilgisini ekle
+    container_ids = {log.container_id for log in logs if log.container_id}
+    owners_by_id = {}
+    if container_ids:
+        infos = db.query(ContainerInfo).filter(ContainerInfo.container_id.in_(container_ids)).all()
+        owners_by_id = {info.container_id: info.owner for info in infos}
+
+    result = []
+    for log in logs:
+        result.append({
+            "id": log.id,
+            "timestamp": log.timestamp,
+            "user": log.user,
+            "status": log.status,
+            "pid": log.pid,
+            "executable": log.executable,
+            "operation": log.operation,
+            "syscall": log.syscall,
+            "command": log.command,
+            "container_id": log.container_id,
+            "container_name": log.container_name,
+            "container_owner": owners_by_id.get(log.container_id),
+            "unauthorized": log.unauthorized,
+        })
+
+    return result
 
 # ---------------- Metrikler ----------------
 
@@ -354,6 +454,8 @@ def get_metrics_history(
     end_date: str = None,
     server_name: str = None,
     db: Session = Depends(get_db),
+    _current_user: str = Depends(verify_token),
+        
 ):
     query = db.query(SystemMetrics)
     if start_date:
@@ -412,6 +514,21 @@ def ingest_docker_event(payload: dict, db: Session = Depends(get_db)):
             info.owner = owner
             db.commit()
 
+            
+    # --- stop/die durumunda status güncelle, destroy/rm durumunda kaydı sil ---
+    if container_id:
+        info = db.query(ContainerInfo).filter(ContainerInfo.container_id == container_id).first()
+        if info:
+            if action in ("stop", "die", "kill"):
+                info.status = "exited"
+                info.last_seen = datetime.now()
+                db.commit()
+                print(f"[*] Container durduruldu: {container_name} ({action})", flush=True)
+            elif action == "destroy":
+                db.delete(info)
+                db.commit()
+                print(f"[*] Container silindi: {container_name}", flush=True)
+            
     return {"status": "ok"}
 
 
@@ -450,6 +567,7 @@ def get_containers(
     status: str = None,
     owner: str = None,
     db: Session = Depends(get_db),
+    _current_user: str = Depends(verify_token),
 ):
     query = db.query(ContainerInfo)
     if server_name:
