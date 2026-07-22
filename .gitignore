@@ -23,3 +23,7 @@ frontend/.vite/
 
 # OS
 .DS_Store
+
+# Editor temp/backup files
+#*#
+*~
