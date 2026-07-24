@@ -4,7 +4,7 @@ import { ChartContainer, ChartTooltip } from "./components/ui/chart";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui/table";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
-import { ChevronDown, ChevronUp, Activity, ShieldAlert, Database, Clock, Box, AlertTriangle } from "lucide-react";
+import { ChevronDown, ChevronUp, Activity, ShieldAlert, Database, Clock, Box, AlertTriangle, List, BarChart2 } from "lucide-react";
 import Login from "./Login";
 
 const API = "http://localhost:8000";
@@ -25,7 +25,15 @@ export default function App() {
     const [logFilters, setLogFilters] = useState({
 	user: "", container_name: "", status: "", command_contains: "", unauthorized_only: false,
     });
-
+    const [userResources, setUserResources] = useState([]);
+    const [userResourceView, setUserResourceView] = useState("list"); // list | chart | pie
+    const [expandedOwners, setExpandedOwners] = useState({});
+    const toggleOwner = (owner) => setExpandedOwners(prev => ({ ...prev, [owner]: !prev[owner] }));
+    const [userResourceSubTab, setUserResourceSubTab] = useState("live"); // live | history
+    const [userResourceHistory, setUserResourceHistory] = useState([]);
+    const [userHistoryFilterDates, setUserHistoryFilterDates] = useState({ start: "", end: "" });
+    const [userHistoryView, setUserHistoryView] = useState("list"); // list | chart | pie
+    
     const safeSetLogs = (data) => {
 	if (Array.isArray(data)) {
 	    setLogs(data);
@@ -92,10 +100,12 @@ export default function App() {
     }, [authToken]);
 
     
-    const fetchHistoryMetrics = () => {
+    const fetchHistoryMetrics = () => fetchHistoryMetricsWithDates(filterDates);
+    
+    const fetchHistoryMetricsWithDates = (dates) => {
 	let url = `${API}/api/metrics/history`;
-	if (filterDates.start && filterDates.end) {
-	    url += `?start_date=${filterDates.start}&end_date=${filterDates.end}`;
+	if (dates.start && dates.end) {
+	    url += `?start_date=${encodeURIComponent(dates.start)}&end_date=${encodeURIComponent(dates.end)}`;
 	}
 	authFetch(url).then(r => r.json()).then(setHistoryMetrics).catch(console.error);
     };
@@ -173,9 +183,118 @@ export default function App() {
 	{ name: "Durdu", value: containerSummary.stopped, color: "#f43f5e" },
     ];
 
+    const fetchUserResources = () => {
+	authFetch(`${API}/api/users/resource-usage`).then(r => r.json()).then(setUserResources).catch(console.error);
+    };
+
+    const activeTabRef = useRef(activeTab);
+    useEffect(() => {
+	activeTabRef.current = activeTab;
+    }, [activeTab]);
+    
+    useEffect(() => {
+	if (!authToken) return;
+	const fetchData = () => {
+	    authFetch(`${API}/api/logs?${buildLogQueryParams(logFiltersRef.current)}`)
+		.then(r => r.json()).then(safeSetLogs).catch(console.error);
+	    authFetch(`${API}/api/metrics/live`).then(r => r.json()).then(setLiveMetrics).catch(console.error);
+	    authFetch(`${API}/api/containers/summary`).then(r => r.json()).then(setContainerSummary).catch(console.error);
+	    if (activeTabRef.current === "user_resources") {
+		fetchUserResources();
+	    }
+	};
+	fetchData();
+	const interval = setInterval(fetchData, 3000);
+	return () => clearInterval(interval);
+    }, [authToken]);
+
+    const UserCpuPieTooltip = ({ active, payload }) => {
+	if (!active || !payload || !payload.length) return null;
+	const data = payload[0].payload;
+
+	return (
+	    <div className="bg-slate-900 border border-slate-700 p-3 rounded text-xs font-mono shadow-xl max-w-xs">
+		<p className="text-cyan-400 font-bold border-b border-slate-800 pb-1 mb-2">
+		    👤 {data.owner}
+		</p>
+		<p className="text-slate-300">
+		    Toplam CPU: <span className="text-cyan-400">{data.cpu_total}%</span>
+		</p>
+		<p className="text-slate-500 mt-2 mb-1">Container'lar:</p>
+		{data.containers?.map((c) => (
+		    <p key={c.name} className="text-slate-400 pl-2">
+			📦 {c.name} — CPU: {c.cpu}%
+		    </p>
+		))}
+	    </div>
+	);
+    };
+
+    const UserRamPieTooltip = ({ active, payload }) => {
+        if (!active || !payload || !payload.length) return null;
+        const data = payload[0].payload;
+
+        return (
+            <div className="bg-slate-900 border border-slate-700 p-3 rounded text-xs font-mono shadow-xl max-w-xs">
+                <p className="text-cyan-400 font-bold border-b border-slate-800 pb-1 mb-2">
+                    👤 {data.owner}
+                </p>
+                <p className="text-slate-300">
+                    Toplam RAM:{" "}
+                    <span className="text-purple-400">
+                        {data.ram_percent}% ({data.ram_total_mb} MB)
+                    </span>
+                </p>
+                <p className="text-slate-500 mt-2 mb-1">Container'lar:</p>
+                    {data.containers?.map((c) => (
+                        <p key={c.name} className="text-slate-400 pl-2">
+                            📦 {c.name} — RAM: {c.ram_percent}% ({c.ram_mb}MB)
+                        </p>
+                    ))}
+                    </div>
+		    );
+		    };
+
+    
+    const fetchUserResourceHistory = (dates) => {
+	const d = dates || userHistoryFilterDates;
+	let url = `${API}/api/users/resource-usage/history`;
+	if (d.start && d.end) {
+	    url += `?start_date=${encodeURIComponent(d.start)}&end_date=${encodeURIComponent(d.end)}`;
+	}
+	authFetch(url).then(r => r.json()).then(data => setUserResourceHistory(Array.isArray(data) ? data : [])).catch(console.error);
+    };
+
+    const groupByOwner = (data) => {
+	const groups = {};
+	data.forEach((item) => {
+	    if (!groups[item.owner]) groups[item.owner] = [];
+	    groups[item.owner].push(item);
+	});
+	return groups;
+    };
+
+    // Liste/Pie görünümü için dönem özeti (ortalama) hesapla
+    const getUserHistorySummary = () => {
+	const groups = groupByOwner(userResourceHistory);
+	return Object.entries(groups).map(([owner, points]) => {
+	    const avgCpu = points.reduce((s, p) => s + p.cpu_total, 0) / points.length;
+	    const avgRamPercent = points.reduce((s, p) => s + p.ram_percent, 0) / points.length;
+	    const avgRamMb = points.reduce((s, p) => s + p.ram_total_mb, 0) / points.length;
+	    return {
+		owner,
+		cpu_total: Math.round(avgCpu * 100) / 100,
+		ram_percent: Math.round(avgRamPercent * 10) / 10,
+		ram_total_mb: Math.round(avgRamMb * 100) / 100,
+		point_count: points.length,
+	    };
+	}).sort((a, b) => b.cpu_total - a.cpu_total);
+    };
+    
     if (!authToken) {
 	return <Login onLoginSuccess={handleLoginSuccess} />;
     }
+
     
     return (
 	<div className="p-8 bg-slate-950 min-h-screen text-slate-100 dark">
@@ -188,7 +307,8 @@ export default function App() {
 		    <TabButton id="dashboard" label="Dashboard" />
 		    <TabButton id="logs" label="Loglar" />
 		    <TabButton id="containers" label="Containerlar" />
-		    <TabButton id="metrics_history" label="Geçmiş Kaynak Analizi" />
+		    <TabButton id="metrics_history" label="Sunucu/Container Kaynak Kullanımı" />
+		    <TabButton id="user_resources" label="Kullanıcı Kaynak Kullanımı" />
 		</div>
 		<div className="flex items-center gap-3">
 		    <span className="text-xs font-mono text-slate-500">👤 {authUser}</span>
@@ -455,26 +575,73 @@ export default function App() {
 	    {activeTab === "metrics_history" && (
 		<div className="space-y-6">
 		    <Card className="bg-slate-900 border-slate-800">
-			<CardContent className="flex flex-wrap items-end gap-4 pt-6">
-			    <div className="flex flex-col gap-1.5 text-xs font-mono">
-				<span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Başlangıç</span>
-				<input type="text" placeholder="YYYY-MM-DD HH:MM:SS" value={filterDates.start}
-				       onChange={(e) => setFilterDates(p => ({ ...p, start: e.target.value }))}
-				       className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 text-xs w-52 font-mono" />
+			<CardContent className="flex flex-col gap-4 pt-6">
+			    <div className="flex flex-wrap gap-2">
+				{[
+				    { label: "Son 1 Gün", days: 1 },
+				    { label: "Son 1 Hafta", days: 7 },
+				    { label: "Son 1 Ay", days: 30 },
+				    { label: "Son 3 Ay", days: 90 },
+				    { label: "Son 6 Ay", days: 180 },
+				    { label: "Son 1 Yıl", days: 365 },
+				].map((preset) => (
+				    <button
+					key={preset.label}
+					onClick={() => {
+					    const end = new Date();
+					    const start = new Date();
+					    start.setDate(start.getDate() - preset.days);
+					    const fmt = (d) => d.toISOString().slice(0, 19).replace("T", " ");
+					    const newDates = { start: fmt(start), end: fmt(end) };
+					    setFilterDates(newDates);
+					    fetchHistoryMetricsWithDates(newDates);
+					}}
+					className="px-3 py-1.5 text-xs font-mono rounded bg-slate-950 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/50 border border-slate-800 transition-colors"
+				    >
+					{preset.label}
+				    </button>
+				))}
 			    </div>
-			    <div className="flex flex-col gap-1.5 text-xs font-mono">
-				<span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Bitiş</span>
-				<input type="text" placeholder="YYYY-MM-DD HH:MM:SS" value={filterDates.end}
-				       onChange={(e) => setFilterDates(p => ({ ...p, end: e.target.value }))}
-				       className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 text-xs w-52 font-mono" />
+
+			    <div className="flex flex-wrap items-end gap-4">
+				<div className="flex flex-col gap-1.5 text-xs font-mono">
+				    <span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Başlangıç Tarihi</span>
+				    <input
+					type="date"
+					onChange={(e) => setFilterDates(p => ({ ...p, start: e.target.value ? `${e.target.value} 00:00:00` : "" }))}
+					className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs font-mono"
+				    />
+				</div>
+				<div className="flex flex-col gap-1.5 text-xs font-mono">
+				    <span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Bitiş Tarihi</span>
+				    <input
+					type="date"
+					onChange={(e) => setFilterDates(p => ({ ...p, end: e.target.value ? `${e.target.value} 23:59:59` : "" }))}
+					className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs font-mono"
+				    />
+				</div>
+				<button onClick={fetchHistoryMetrics}
+					className="bg-cyan-500 text-slate-950 text-xs font-mono font-bold px-5 py-2 rounded hover:bg-cyan-400 transition-colors">
+				    Metrikleri Filtrele
+				</button>
+				<button
+				    onClick={() => {
+					const cleared = { start: "", end: "" };
+					setFilterDates(cleared);
+					fetchHistoryMetricsWithDates(cleared);
+				    }}
+				    className="bg-slate-800 text-slate-300 text-xs font-mono font-bold px-5 py-2 rounded hover:bg-slate-700 transition-colors"
+				>
+				    Filtreyi Sıfırla
+				</button>
+				{filterDates.start && (
+				    <span className="text-[10px] font-mono text-slate-500">
+					Seçili: {filterDates.start} → {filterDates.end}
+				    </span>
+				)}
 			    </div>
-			    <button onClick={fetchHistoryMetrics}
-				    className="bg-cyan-500 text-slate-950 text-xs font-mono font-bold px-5 py-2 rounded hover:bg-cyan-400 transition-colors">
-				Metrikleri Filtrele
-			    </button>
 			</CardContent>
 		    </Card>
-
 		    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 			{Object.entries(groupByName(historyMetrics.host)).map(([serverName, data]) => (
 			    <Card key={`host-chart-${serverName}`} className="bg-slate-900 border-slate-800">
@@ -542,6 +709,283 @@ export default function App() {
 		    </div>
 		</div>
 	    )}
+	{/*-----------KULLANICI BAZLI KAYNAK KULLANIMI--------------------*/}   
+	    {activeTab === "user_resources" && (
+		<div className="space-y-4">
+		    <div className="flex gap-2 bg-slate-900 p-1 rounded border border-slate-800 w-fit">
+			<button
+			    onClick={() => setUserResourceSubTab("live")}
+			    className={`px-4 py-1.5 text-xs font-mono rounded transition-colors ${userResourceSubTab === "live" ? "bg-cyan-500 text-slate-950 font-bold" : "text-slate-400 hover:text-slate-200"}`}
+			>
+			    Anlık
+			</button>
+			<button
+			    onClick={() => {
+				setUserResourceSubTab("history");
+				fetchUserResourceHistory();
+			    }}
+			    className={`px-4 py-1.5 text-xs font-mono rounded transition-colors ${userResourceSubTab === "history" ? "bg-cyan-500 text-slate-950 font-bold" : "text-slate-400 hover:text-slate-200"}`}
+			>
+			    Geçmiş
+			</button>
+		    </div>
+
+		    {userResourceSubTab === "live" && (
+			<>
+			    <Card className="bg-slate-900 border-slate-800">
+				<CardContent className="flex items-center gap-2 pt-6">
+				    <span className="text-xs font-mono text-slate-400 mr-2">Görünüm:</span>
+				    {[
+					{ id: "list", label: "Liste" },
+					{ id: "chart", label: "Grafik" },
+					{ id: "pie", label: "Pie Chart" },
+				    ].map((v) => (
+					<button
+					    key={v.id}
+					    onClick={() => setUserResourceView(v.id)}
+					    className={`px-3 py-1.5 text-xs font-mono rounded transition-colors ${userResourceView === v.id ? "bg-cyan-500 text-slate-950 font-bold" : "bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800"}`}
+					>
+					    {v.label}
+					</button>
+				    ))}
+				</CardContent>
+			    </Card>
+
+			    {userResourceView === "list" && (
+				<Card className="bg-slate-900 border-slate-800 overflow-hidden">
+				    <CardContent className="p-0">
+					<Table>
+					    <TableHeader className="bg-slate-950">
+						<TableRow className="border-slate-800">
+						    <TableHead className="w-[30px]"></TableHead>
+						    <TableHead className="text-slate-400">Kullanıcı</TableHead>
+						    <TableHead className="text-slate-400">Container Sayısı</TableHead>
+						    <TableHead className="text-slate-400">Toplam CPU Kullanımı (%)</TableHead>
+						    <TableHead className="text-slate-400">Toplam RAM Kullanımı (%)</TableHead>
+						</TableRow>
+					    </TableHeader>
+					    <TableBody>
+						{userResources.map((u) => (
+						    <React.Fragment key={u.owner}>
+							<TableRow
+							    onClick={() => toggleOwner(u.owner)}
+							    className="border-slate-800/60 hover:bg-slate-800/30 transition-colors cursor-pointer"
+							>
+							    <TableCell className="text-slate-500">
+								{expandedOwners[u.owner] ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+							    </TableCell>
+							    <TableCell className="font-mono text-slate-300">👤 {u.owner}</TableCell>
+							    <TableCell className="font-mono text-slate-400 text-xs">{u.container_count}</TableCell>
+							    <TableCell className="font-mono text-cyan-400 text-xs">{u.cpu_total}%</TableCell>
+							    <TableCell className="font-mono text-purple-400 text-xs">
+								{u.ram_percent}% <span className="text-slate-500">({u.ram_total_mb} MB)</span>
+							    </TableCell>
+							</TableRow>
+							{expandedOwners[u.owner] && (
+							    <TableRow className="bg-slate-950/60 border-b border-slate-800">
+								<TableCell colSpan={5} className="p-4">
+								    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+									{u.containers.map((c) => (
+									    <div key={c.name} className="bg-slate-900/60 border border-slate-800 rounded p-2 text-xs font-mono">
+										<p className="text-cyan-400">📦 {c.name}</p>
+										<p className="text-slate-400 mt-1">
+										    CPU: {c.cpu}% · RAM: {c.ram_percent}% <span className="text-slate-600">({c.ram_mb} MB)</span>
+										</p>
+									    </div>
+									))}
+								    </div>
+								</TableCell>
+							    </TableRow>
+							)}
+						    </React.Fragment>
+						))}
+					    </TableBody>
+					</Table>
+				    </CardContent>
+				</Card>
+			    )}
+
+			    {userResourceView === "chart" && (
+				<Card className="bg-slate-900 border-slate-800">
+				    <CardContent className="h-[400px] pt-6">
+					<ChartContainer>
+					    <BarChart data={userResources}>
+						<CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+						<XAxis dataKey="owner" stroke="#64748b" fontSize={11} />
+						<YAxis stroke="#64748b" fontSize={11} domain={[0,100]}/>
+						<Tooltip
+						    cursor={false}
+						    contentStyle={{ backgroundColor: "#0f172a", borderColor: "#1e293b" }}
+						    formatter={(value, name, props) => {
+							if (name === "RAM (%)") {
+							    return [`${value}% (${props.payload.ram_total_mb} MB)`, name];
+							}
+							return [`${value}%`, name];
+						    }}
+						/>
+						<Legend wrapperStyle={{ fontSize: 11, fontFamily: "monospace" }} />
+						<Bar dataKey="cpu_total" name="CPU (%)" fill="#22d3ee" radius={[4, 4, 0, 0]} />
+						<Bar dataKey="ram_percent" name="RAM (%)" fill="#a78bfa" radius={[4, 4, 0, 0]} />
+					    </BarChart>
+					</ChartContainer>
+				    </CardContent>
+				</Card>
+			    )}
+
+			    {userResourceView === "pie" && (
+				<div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+				    <Card className="bg-slate-900 border-slate-800">
+					<CardHeader><CardTitle className="text-sm font-mono text-slate-200">CPU Dağılımı</CardTitle></CardHeader>
+					<CardContent className="h-[340px]">
+					    <ChartContainer>
+						<PieChart>
+						    <Pie data={userResources} dataKey="cpu_total" nameKey="owner" outerRadius={90} label>
+							{userResources.map((_, idx) => (
+							    <Cell key={idx} fill={["#22d3ee", "#a78bfa", "#f59e0b", "#ec4899", "#10b981"][idx % 5]} />
+							))}
+						    </Pie>
+						    <Tooltip content={<UserCpuPieTooltip />} cursor={false} />
+						    <Legend wrapperStyle={{ fontSize: 11, fontFamily: "monospace" }} />
+						</PieChart>
+					    </ChartContainer>
+					</CardContent>
+				    </Card>
+				    <Card className="bg-slate-900 border-slate-800">
+					<CardHeader><CardTitle className="text-sm font-mono text-slate-200">RAM Dağılımı</CardTitle></CardHeader>
+					<CardContent className="h-[340px]">
+					    <ChartContainer>
+						<PieChart>
+						    <Pie data={userResources} dataKey="ram_percent" nameKey="owner" outerRadius={90} label>
+							{userResources.map((_, idx) => (
+							    <Cell key={idx} fill={["#a78bfa", "#22d3ee", "#f59e0b", "#ec4899", "#10b981"][idx % 5]} />
+							))}
+						    </Pie>
+						    <Tooltip content={<UserRamPieTooltip />} cursor={false} />
+						    <Legend wrapperStyle={{ fontSize: 11, fontFamily: "monospace" }} />
+						</PieChart>
+					    </ChartContainer>
+					</CardContent>
+				    </Card>
+				</div>
+			    )}
+			</>
+		    )}
+
+		    {userResourceSubTab === "history" && (
+			<>
+			    {/* Tarih filtresi + presetler (container history sayfasındakiyle aynı yapı) */}
+			    <Card className="bg-slate-900 border-slate-800">
+				<CardContent className="flex flex-col gap-4 pt-6">
+				    <div className="flex flex-wrap gap-2">
+					{[
+					    { label: "Son 1 Gün", days: 1 },
+					    { label: "Son 1 Hafta", days: 7 },
+					    { label: "Son 1 Ay", days: 30 },
+					    { label: "Son 3 Ay", days: 90 },
+					    { label: "Son 6 Ay", days: 180 },
+					    { label: "Son 1 Yıl", days: 365 },
+					].map((preset) => (
+					    <button
+						key={preset.label}
+						onClick={() => {
+						    const end = new Date();
+						    const start = new Date();
+						    start.setDate(start.getDate() - preset.days);
+						    const fmt = (d) => d.toISOString().slice(0, 19).replace("T", " ");
+						    const newDates = { start: fmt(start), end: fmt(end) };
+						    setUserHistoryFilterDates(newDates);
+						    fetchUserResourceHistory(newDates);
+						}}
+						className="px-3 py-1.5 text-xs font-mono rounded bg-slate-950 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/50 border border-slate-800 transition-colors"
+					    >
+						{preset.label}
+					    </button>
+					))}
+				    </div>
+				    <div className="flex flex-wrap items-end gap-4">
+					<div className="flex flex-col gap-1.5 text-xs font-mono">
+					    <span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Başlangıç Tarihi</span>
+					    <input
+						type="date"
+						onChange={(e) => setUserHistoryFilterDates(p => ({ ...p, start: e.target.value ? `${e.target.value} 00:00:00` : "" }))}
+						className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs font-mono"
+					    />
+					</div>
+					<div className="flex flex-col gap-1.5 text-xs font-mono">
+					    <span className="text-slate-400 flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> Bitiş Tarihi</span>
+					    <input
+						type="date"
+						onChange={(e) => setUserHistoryFilterDates(p => ({ ...p, end: e.target.value ? `${e.target.value} 23:59:59` : "" }))}
+						className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded text-slate-200 focus:outline-none focus:border-cyan-500 text-xs font-mono"
+					    />
+					</div>
+					<button onClick={() => fetchUserResourceHistory()}
+						className="bg-cyan-500 text-slate-950 text-xs font-mono font-bold px-5 py-2 rounded hover:bg-cyan-400 transition-colors">
+					    Filtrele
+					</button>
+					<button
+					    onClick={() => {
+						const cleared = { start: "", end: "" };
+						setUserHistoryFilterDates(cleared);
+						fetchUserResourceHistory(cleared);
+					    }}
+					    className="bg-slate-800 text-slate-300 text-xs font-mono font-bold px-5 py-2 rounded hover:bg-slate-700 transition-colors"
+					>
+					    Filtreyi Sıfırla
+					</button>
+				    </div>
+				</CardContent>
+			    </Card>
+
+			    {/* Görünüm seçici */}
+			    <Card className="bg-slate-900 border-slate-800">
+				<CardContent className="flex items-center gap-2 pt-6">
+				    <span className="text-xs font-mono text-slate-400 mr-2">Görünüm:</span>
+				    {[
+					{ id: "chart", label: "Grafik" },
+					
+				    ].map((v) => (
+					<button
+					    key={v.id}
+					    onClick={() => setUserHistoryView(v.id)}
+					    className={`px-3 py-1.5 text-xs font-mono rounded transition-colors ${userHistoryView === v.id ? "bg-cyan-500 text-slate-950 font-bold" : "bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800"}`}
+					>
+					    {v.label}
+					</button>
+				    ))}
+				</CardContent>
+			    </Card>
+
+			    {userHistoryView === "chart" && (
+				<div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+				    {Object.entries(groupByOwner(userResourceHistory)).map(([owner, points]) => (
+					<Card key={`user-history-${owner}`} className="bg-slate-900 border-slate-800">
+					    <CardHeader>
+						<CardTitle className="text-sm font-mono text-slate-200">👤 {owner}</CardTitle>
+					    </CardHeader>
+					    <CardContent className="h-[260px] pl-0">
+						<ChartContainer>
+						    <LineChart data={points}>
+							<CartesianGrid stroke="#1e293b" strokeDasharray="3 3" />
+							<XAxis dataKey="timestamp" hide />
+							<YAxis stroke="#64748b" fontSize={10} domain={[0, 100]} />
+							<Tooltip cursor={false} contentStyle={{ backgroundColor: "#0f172a", borderColor: "#1e293b" }} />
+							<Legend wrapperStyle={{ fontSize: 11, fontFamily: "monospace" }} />
+							<Line type="monotone" dataKey="cpu_total" name="CPU (%)" stroke="#22d3ee" strokeWidth={2} dot={false} />
+							<Line type="monotone" dataKey="ram_percent" name="RAM (%)" stroke="#a78bfa" strokeWidth={2} dot={false} />
+						    </LineChart>
+						</ChartContainer>
+					    </CardContent>
+					</Card>
+				    ))}
+				</div>
+			    )}
+
+			</>
+		    )}
+		</div>
+	    )}
 	</div>
     );
 }
+

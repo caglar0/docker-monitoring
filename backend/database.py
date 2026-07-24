@@ -44,11 +44,11 @@ class ContainerInfo(Base):
     container_id = Column(String(64), unique=True, index=True)
     container_name = Column(String(255), index=True)
     owner = Column(String(255), nullable=True, index=True)
-    status = Column(String(50))  # "running" / "exited" vb.
+    status = Column(String(50))  # "running" / "exited" / "deleted" vb.
     server_name = Column(String(255))
     image = Column(String(255), nullable=True)
     last_seen = Column(DateTime)
-
+    deleted_at = Column(DateTime, nullable=True)  
 
 class ContainerEvent(Base):
     """docker events akışının kalıcı hali - yaşam döngüsü zaman çizelgesi için."""
