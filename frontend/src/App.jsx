@@ -71,17 +71,19 @@ export default function App() {
 	setAuthUser(null);
     };
     
-    const authFetch = (url, options = {}) => {
-	return fetch(url, {
-	    ...options,
-	    headers: {
+    
+
+    const authFetch = async (url, options = {}) => {
+	const res = await fetch(url, {
+            ...options,
+            headers: {
 		...options.headers,
 		"Authorization": `Bearer ${authToken}`,
-	    },
+            },
 	});
 	if (res.status === 401) {
-	    handleLogout();
-	    throw new Error("Oturum süresi doldu, lütfen tekrar giriş yapın");
+            handleLogout();
+            throw new Error("Oturum süresi doldu, lütfen tekrar giriş yapın");
 	}
 	return res;
     };

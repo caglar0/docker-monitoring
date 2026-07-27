@@ -26,7 +26,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 JWT_SECRET = os.getenv("JWT_SECRET", "insecure-default-change-me")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_HOURS = 72
+JWT_EXPIRE_HOURS = 168
 
 
 DOCKER_SUBCOMMANDS = {
@@ -69,18 +69,18 @@ NOISE_SUBCOMMANDS = {
     "info", "version", "ps", "events", "logs",
 }
 
-# Yetkisiz erişim kontrolü uygulanacak subcommand'ler
+# Yetkisiz erişim kontrolü uygulanacak subcommandler
 OWNERSHIP_SENSITIVE_SUBCOMMANDS = {
     "exec", "start", "stop", "restart", "kill", "rm", "logs", "attach", "cp", "pause", "unpause",
 }
 
-# Bu subcommand'lerde container zaten var, event'e gerek yok - direkt argümandan alınır
+# subcommandlerde container zaten var, evente gerek yok - direkt argümandan alınır
 DIRECT_TARGET_SUBCOMMANDS = {
     "start", "stop", "restart", "kill", "rm", "exec",
     "logs", "attach", "cp", "pause", "unpause",
 }
 
-# Sadece bu ikisinde container henüz yok, event correlation gerekli
+# container henüz yok, event correlation gerekli
 EVENT_CORRELATION_SUBCOMMANDS = {"run", "create"}
 
 
@@ -165,7 +165,7 @@ def extract_execve(line: str) -> str:
 def extract_positional_target(command: str, subcommand: str) -> str | None:
     """
     start/stop/exec/kill/rm/pause/unpause/logs/attach/cp gibi komutlarda
-    container adı/ID'si komutun kendi argümanında zaten var - onu çıkarır.
+    container adı komutun kendi argümanında zaten var - onu çıkarır.
     Flag'leri (- ile başlayanları) atlar, ilk pozisyonel argümanı döner.
     """
     parts = command.strip().split()
@@ -232,14 +232,14 @@ def parse_log(lines: list[str]) -> dict | None:
     return record
 
 def find_matching_container_event(audit_epoch: float) -> dict | None:
-    # Pencere içindeki TÜM adayları bul
+    # Pencere içindeki tüm adayları bul
     candidates = [
         e for e in recent_docker_events
         if abs(e["event_time"] - audit_epoch) <= DOCKER_EVENT_MATCH_WINDOW
     ]
     if not candidates:
         return None
-    # En yakın olanı seç (mevcut davranış, ama artık daha dar pencerede)
+    # En yakın olanı seç
     return min(candidates, key=lambda e: abs(e["event_time"] - audit_epoch))
 
 def check_unauthorized_access(db: Session, container_id: str, container_name: str, acting_user: str) -> bool:
@@ -278,14 +278,14 @@ async def flush_loop():
                 match_found = False
 
                 if subcommand in DIRECT_TARGET_SUBCOMMANDS:
-                    # Katman 1: Container adı/ID zaten komutun argümanında var
+                    # 1: Container adı/ID zaten komutun argümanında var
                     target = extract_positional_target(parsed_res["command"], subcommand)
                     if target:
                         #info = (
                             #db_lookup_container_by_name_or_id(target)
                             #if False else None
                         #)
-                        # ContainerInfo'dan doğrudan sorgula
+                        
                         db_temp = SessionLocal()
                         try:
                             info = (
@@ -306,7 +306,7 @@ async def flush_loop():
                 elif subcommand in EVENT_CORRELATION_SUBCOMMANDS:
                     intended_name = extract_intended_container_name(parsed_res["command"] or "")
                     if intended_name:
-                        # Katman 2: --name verilmiş, isim bazlı kesin eşleştirme
+                        # 2: --name verilmiş, isim bazlı kesin eşleştirme
                         name_matches = [
                             e for e in recent_docker_events
                             if e["container_name"] == intended_name and e["action"] in ("create", "start")
@@ -318,7 +318,7 @@ async def flush_loop():
                             container_name = best["container_name"]
                             match_found = True
                     else:
-                        # Katman 3: İsimsiz, FIFO kuyruktan çözülmüş mü kontrol et
+                        # 3: İsimsiz, FIFO kuyruktan çözülmüş mü kontrol et
                         resolved = resolved_container_matches.pop(audit_id, None)
                         if resolved:
                             container_id = resolved["container_id"]
@@ -394,7 +394,7 @@ def receive_agent_logs(payload: dict):
     pending_events[audit_id]["lines"].append(raw_log)
     pending_events[audit_id]["last_seen"] = time.time()
 
-    # EXECVE satırı geldiyse, isimsiz run/create ise FIFO kuyruğa erken kaydet
+    # EXECVE satırı geldiyse isimsiz run/create ise FIFO kuyruğa erken kaydet
     if "type=EXECVE" in raw_log:
         command = extract_execve(raw_log)
         parts = command.strip().split()
@@ -416,7 +416,7 @@ def extract_intended_container_name(command: str) -> str | None:
     match = NAME_FLAG_PATTERN.search(command)
     return match.group(1) if match else None
 
-# ---------------- Loglar (Filtrelenebilir) ----------------
+# ---------------- Loglar ----------------
 
 @app.get("/api/logs")
 def get_logs_api(
@@ -493,16 +493,13 @@ def ingest_metrics(payload: dict, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "ok"}
 
+
 @app.get("/api/metrics/live")
 def get_live_metrics(db: Session = Depends(get_db), _current_user: str = Depends(verify_token)):
     subq = (
         db.query(
-            SystemMetrics.target_name,
-            SystemMetrics.target_type,
-            SystemMetrics.cpu_usage,
-            SystemMetrics.ram_usage,
-            SystemMetrics.ram_usage_mb,
-            SystemMetrics.ram_total_mb,
+            SystemMetrics.target_name, SystemMetrics.target_type, SystemMetrics.cpu_usage,
+            SystemMetrics.ram_usage, SystemMetrics.ram_usage_mb, SystemMetrics.ram_total_mb,
             SystemMetrics.timestamp,
         )
         .order_by(SystemMetrics.timestamp.desc())
@@ -516,8 +513,8 @@ def get_live_metrics(db: Session = Depends(get_db), _current_user: str = Depends
         if key not in latest:
             latest[key] = row
 
-    # Sadece SİLİNMEMİŞ container'ların isim setini oluştur
-    infos = db.query(ContainerInfo).filter(ContainerInfo.status != "deleted").all()
+    # Sadece u an çalışan containerların isim setini oluştur
+    infos = db.query(ContainerInfo).filter(ContainerInfo.status == "running").all()
     existing_names = set()
     for info in infos:
         existing_names.add(f"{info.server_name}/{info.container_name}")
@@ -565,13 +562,13 @@ def get_metrics_history(
         deleted_at_by_name[info.container_name] = info.deleted_at
 
     def is_valid_at(target_name: str, ts) -> bool:
-        # Container hiç kayıtlı değilse (agent hiç görmediyse), veriyi göster (eski davranışa göre daha toleranslı)
+        # Container hiç kayıtlı değilse (agent hiç görmediyse), veriyi göster
         if target_name not in deleted_at_by_name:
             return True
         deleted_at = deleted_at_by_name[target_name]
         if deleted_at is None:
-            return True  # hâlâ yaşıyor, her zaman geçerli
-        return ts <= deleted_at  # sadece silinmeden ÖNCEKİ veriler geçerli
+            return True  # hala yaşıyor, her zaman geçerli
+        return ts <= deleted_at  # sadece silinmeden önceki veriler geçerli
 
     host_rows = [
         {"timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S"), "cpu_usage": r.cpu_usage,
@@ -603,11 +600,11 @@ def ingest_docker_event(payload: dict, db: Session = Depends(get_db)):
         "event_time": event_time,
     }
 
-    # Sadece create/start event'leri container oluşumu için anlamlı
+    # Sadece create/start eventleri 
     if action in ("create", "start"):
         with container_queue_lock:
             now = time.time()
-            # Süresi dolmuş (5sn'den eski) bekleyen istekleri temizle
+            # Süresi dolmuş istekleri temizle
             while container_action_queue and (now - container_action_queue[0]["epoch"] > MAX_WAIT_FOR_EVENT):
                 container_action_queue.popleft()
 
@@ -618,7 +615,7 @@ def ingest_docker_event(payload: dict, db: Session = Depends(get_db)):
                     "container_name": container_name,
                 }
 
-    # İsim bazlı eşleştirme için (run --name X durumları) eski deque'ye de ekle
+    # İsim bazlı eşleştirme için (run --name  durumları) eski deque'ye de ekle
     recent_docker_events.append(event_entry)
 
     db.add(ContainerEvent(
@@ -763,8 +760,8 @@ def get_user_resource_usage(db: Session = Depends(get_db), _current_user: str = 
         if row.target_name not in latest_by_container:
             latest_by_container[row.target_name] = row
 
-    # Sadece silinmemiş container'lar
-    infos = db.query(ContainerInfo).filter(ContainerInfo.status != "deleted").all()
+    # Sadece silinmemiş containerlar
+    infos = db.query(ContainerInfo).filter(ContainerInfo.status == "running").all()
     owner_by_qualified_name = {}
     existing_qualified_names = set()
     for info in infos:

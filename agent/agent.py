@@ -78,7 +78,7 @@ def get_host_ram_info():
     return round(used_percent, 1), round(used_kb / 1024, 1), round(total_kb / 1024, 1)
 
 
-# ---------- MB Parse Yardımcıları ----------
+# ---------- MB Parse ----------
 
 def _to_mb(value_str):
     value_str = value_str.strip()
@@ -98,7 +98,6 @@ def _to_mb(value_str):
 
 
 def parse_mem_usage(mem_usage_str):
-    """'12.5MiB / 512MiB' -> (12.5, 512.0) MB cinsinden"""
     try:
         used_str, limit_str = mem_usage_str.split("/")
         return _to_mb(used_str), _to_mb(limit_str)
@@ -164,7 +163,7 @@ def metrics_loop():
             })
 
 
-# ---------- Docker Events (yaşam döngüsü + yetkilendirme) ----------
+# ---------- Docker Events (yaşam döngüsü + owner) ----------
 
 def docker_events_loop():
     while True:
